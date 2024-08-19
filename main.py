@@ -155,7 +155,7 @@ def main():
     optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # dataloader
-    train_dataset = make_train_dataset(tokenizer=tokenizer, tokenizer2=tokenizer_2)
+    train_dataset = make_train_dataset(tokenizer1=tokenizer, tokenizer2=tokenizer_2)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
