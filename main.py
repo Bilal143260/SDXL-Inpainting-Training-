@@ -8,161 +8,37 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjec
 import torch
 import torch.nn.functional as F
 import os
-import itertools
 
-from adapter_network import IPAdapter
 from data_module import MyDataset, collate_fn
-
-def log_validation(
-    vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False
-):
-    logger.info("Running validation... ")
-
-    if not is_final_validation:
-        controlnet = accelerator.unwrap_model(controlnet)
-    else:
-        controlnet = ControlNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
- #StableDiffusionInpaintPipeline
-    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        unet=unet,
-        controlnet=controlnet,
-        safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
-    else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
-
-    image_logs = []
-    inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
-
-    for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        validation_image = Image.open(validation_image).convert("RGB")
-
-        images = []
-
-        for _ in range(args.num_validation_images):
-            with inference_ctx:
-                image = pipeline(
-                    validation_prompt, validation_image, num_inference_steps=20, generator=generator
-                ).images[0]
-
-            images.append(image)
-
-        image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
-        )
-
-    tracker_key = "test" if is_final_validation else "validation"
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                formatted_images = []
-
-                formatted_images.append(np.asarray(validation_image))
-
-                for image in images:
-                    formatted_images.append(np.asarray(image))
-
-                formatted_images = np.stack(formatted_images)
-
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            formatted_images = []
-
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
-
-                for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
-                    formatted_images.append(image)
-
-            tracker.log({tracker_key: formatted_images})
-        else:
-            logger.warning(f"image logging not implemented for {tracker.name}")
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        return image_logs
+from data_module_huggingface import make_train_dataset, prepare_mask_and_masked_image, collate_fn
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
-        required=True,
+        default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+        # required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--pretrained_ip_adapter_path",
-        type=str,
-        default=None,
-        help="Path to pretrained ip adapter model. If not specified weights are initialized randomly.",
     )
     parser.add_argument(
         "--data_json_file",
         type=str,
         default=None,
-        required=True,
+        # required=True,
         help="Training data",
     )
     parser.add_argument(
         "--data_root_path",
         type=str,
         default="",
-        required=True,
+        # required=True,
         help="Training data root path",
-    )
-    parser.add_argument(
-        "--image_encoder_path",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to CLIP image encoder",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="sd-ip_adapter",
+        default="output",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -175,21 +51,13 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--resolution",
-        type=int,
-        default=512,
-        help=(
-            "The resolution for input images"
-        ),
-    )
-    parser.add_argument(
         "--learning_rate",
         type=float,
         default=1e-4,
         help="Learning rate to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=600)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
         "--train_batch_size", type=int, default=8, help="Batch size (per device) for the training dataloader."
     )
@@ -197,7 +65,7 @@ def parse_args():
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=4,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -205,7 +73,7 @@ def parse_args():
     parser.add_argument(
         "--save_steps",
         type=int,
-        default=2000,
+        default=50,
         help=(
             "Save a checkpoint of the training state every X updates"
         ),
@@ -283,12 +151,11 @@ def main():
     text_encoder_2.to(accelerator.device, dtype=weight_dtype)
 
     # optimizer
-    # params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(),  ip_adapter.adapter_modules.parameters())
     params_to_opt = unet.parameters()
     optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # dataloader
-    train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, tokenizer_2=tokenizer_2, size=args.resolution, image_root_path=args.data_root_path)
+    train_dataset = make_train_dataset(tokenizer=tokenizer, tokenizer2=tokenizer_2)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -314,8 +181,6 @@ def main():
                     target_latents = target_latents * vae.config.scaling_factor
                     target_latents = target_latents.to(accelerator.device, dtype=weight_dtype)
 
-                    # print(f"SHAPE OF TARGET LATENTS: {target_latents.shape}")
-
                     # Convert masked images to latent space
                     masked_latents = vae.encode(
                         batch["masked_images"].reshape(batch["target_images"].shape).to(accelerator.device, dtype=torch.float32)
@@ -323,19 +188,7 @@ def main():
                     masked_latents = masked_latents * vae.config.scaling_factor
                     masked_latents = masked_latents.to(accelerator.device, dtype=weight_dtype)
 
-                    # print(f"SHAPE OF MASKED LATENTS: {masked_latents.shape}")
-
                     masks = batch["masks"]
-
-                    # resize the mask to latents shape as we concatenate the mask to the latents
-                    # mask = torch.stack(
-                    #     [
-                    #         torch.nn.functional.interpolate(mask, size=(args.resolution // 8))
-                    #         for mask in masks
-                    #     ]
-                    # )
-                    # mask = mask.reshape(-1, 1, args.resolution // 8)
-
                     mask =  F.interpolate(masks, size=(128, 96), mode='bilinear', align_corners=False)
 
                 # Sample noise that we'll add to the latents
@@ -355,17 +208,6 @@ def main():
 
                 # concatenate the noised latents with the mask and the masked latents
                 latent_model_input = torch.cat([noisy_latents, mask, masked_latents], dim=1)
-                # print(f"SHAPE OF LATENTS: {latent_model_input.shape}")
-
-                # with torch.no_grad():
-                #     image_embeds = image_encoder(batch["clip_cloth_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
-                #     image_embeds_ = []
-                #     for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
-                #         if drop_image_embed == 1:
-                #             image_embeds_.append(torch.zeros_like(image_embed))
-                #         else:
-                #             image_embeds_.append(image_embed)
-                #     image_embeds = torch.stack(image_embeds_)
             
                 with torch.no_grad():
                     encoder_output = text_encoder(batch['text_input_ids'].to(accelerator.device), output_hidden_states=True)
@@ -392,7 +234,6 @@ def main():
 
                 unet_added_cond_kwargs = {"text_embeds": pooled_text_embeds,"time_ids":add_time_ids}
 
-                # noise_pred = ip_adapter(latent_model_input, timesteps, text_embeds, unet_added_cond_kwargs, image_embeds)
                 noise_pred = unet(latent_model_input, timesteps, text_embeds, unet_added_cond_kwargs)
                 
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
@@ -426,8 +267,8 @@ def main():
                 print(f"Epoch {epoch}, Average Loss: {average_loss}")
                 
 
-    ip_adapter = accelerator.unwrap_model(ip_adapter)
-    accelerator.save_model(ip_adapter, args.output_dir, safe_serialization=False)
+    unet = accelerator.unwrap_model(unet)
+    accelerator.save_model(unet, args.output_dir, safe_serialization=False)
 
 if __name__ == "__main__":
     main()    
