@@ -8,9 +8,90 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjec
 import torch
 import torch.nn.functional as F
 import os
+import numpy as np
+import wandb
+import gc
+import contextlib
+import json
+from PIL import Image
+from diffusers import AutoPipelineForInpainting
 
-from data_module import MyDataset, collate_fn
 from data_module_huggingface import make_train_dataset, prepare_mask_and_masked_image, collate_fn
+
+def log_validation(args, vae, text_encoder,text_encoder_2, tokenizer,tokenizer_2, 
+                   unet, accelerator, weight_dtype, is_final_validation=False
+):
+    unet = accelerator.unwrap_model(unet)
+
+    pipeline = AutoPipelineForInpainting.from_pretrained("diffusers/stable-diffusion-xl-1.0-inpainting-0.1", 
+                                                         vae=vae,
+                                                         text_encoder=text_encoder,
+                                                         text_encoder_2=text_encoder_2,
+                                                         tokenizer=tokenizer,
+                                                         tokenizer_2=tokenizer_2,
+                                                         unet=unet,
+                                                         torch_dtype=weight_dtype)
+
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    generator = torch.Generator(device=accelerator.device).manual_seed(0)
+
+    image_logs = []
+    inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
+
+    #read json file
+    val_json_path = args.val_json_file
+    image_root_path = args.image_root_path
+
+    val_data = json.load(open(val_json_path))
+
+    for data in val_data:
+        target_image = Image.open(os.path.join(image_root_path,data["target"])).convert("RGB")
+        mask = Image.open(os.path.join(image_root_path,data["mask"])).convert("L")
+        # target_image = Image.open(os.path.join(image_root_path,data["target"])).convert("RGB").resize((512,512))
+        prompt = data["description"]
+
+        images = []
+
+        for _ in range(2): #number of images
+            with inference_ctx:
+                image = pipeline(
+                    prompt=prompt, image=target_image, mask_image=mask, num_inference_steps=20, generator=generator
+                ).images[0]
+
+            images.append(image)
+
+        image_logs.append(
+            {"target_image": target_image, "mask": mask, "images": images,  "validation_prompt": prompt}
+        )
+
+    tracker_key = "test" if is_final_validation else "validation"
+    for tracker in accelerator.trackers:
+        if tracker.name == "wandb":
+            formatted_images = []
+
+            for log in image_logs:
+                images = log["images"]
+                validation_prompt = log["validation_prompt"]
+                mask = log["mask"]
+                target_image = log["target_image"]
+
+                formatted_images.append(wandb.Image(mask, caption="mask"))
+                formatted_images.append(wandb.Image(target_image, caption="Target Image"))
+                for image in images:
+                    image = wandb.Image(image, caption=validation_prompt)
+                    formatted_images.append(image)
+
+            tracker.log({tracker_key: formatted_images})
+        else:
+            pass
+
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return image_logs
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -53,19 +134,19 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4,
+        default=5e-6,
         help="Learning rate to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
-        "--train_batch_size", type=int, default=8, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--noise_offset", type=float, default=None, help="noise offset")
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=4,
+        default=6,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -73,7 +154,7 @@ def parse_args():
     parser.add_argument(
         "--save_steps",
         type=int,
-        default=50,
+        default=10,
         help=(
             "Save a checkpoint of the training state every X updates"
         ),
@@ -81,7 +162,7 @@ def parse_args():
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default="no",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -97,6 +178,31 @@ def parse_args():
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         ),
+    ),
+    parser.add_argument(
+        "--tracker_project_name",
+        type=str,
+        default="SDXL OutPainting",
+        help=(
+            "The `project_name` argument passed to Accelerator.init_trackers for"
+            " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
+        ),
+    )
+    parser.add_argument(
+        "--val_json_file",
+        type=str,
+        default="/home/bilal/SDXL-Inpainting-Training-/validation_images/test.json",
+    )
+
+    parser.add_argument(
+        "--image_root_path",
+        type=str,
+        default="/home/bilal/SDXL-Inpainting-Training-/validation_images",
+    )
+
+    parser.add_argument(
+        "--do_validation",
+        default=True
     )
     parser.add_argument("--local_rank", type=int, default=0, help="For distributed training: local_rank")
     
@@ -119,6 +225,11 @@ def main():
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
+
+    if accelerator.is_main_process:
+        tracker_config = dict(vars(args))
+
+        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
     if accelerator.is_main_process:
         if args.output_dir is not None:
@@ -168,7 +279,7 @@ def main():
     unet, optimizer, train_dataloader = accelerator.prepare(unet, optimizer, train_dataloader)
 
     global_step = 0
-
+    image_logs = None
     for epoch in range(0, args.num_train_epochs):
         total_loss = 0  # Initialize total loss for the epoch
         num_steps = 0   # Counter for the number of steps
@@ -232,9 +343,9 @@ def main():
                 ]
                 add_time_ids = torch.cat(add_time_ids, dim=1).to(accelerator.device, dtype=weight_dtype)
 
-                unet_added_cond_kwargs = {"text_embeds": pooled_text_embeds,"time_ids":add_time_ids}
+                unet_added_cond_kwargs = {"text_embeds":pooled_text_embeds,"time_ids":add_time_ids}
 
-                noise_pred = unet(latent_model_input, timesteps, text_embeds, unet_added_cond_kwargs)
+                noise_pred = unet(latent_model_input, timesteps, text_embeds, added_cond_kwargs=unet_added_cond_kwargs)[0]
                 
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
@@ -259,6 +370,19 @@ def main():
             if global_step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                 accelerator.save_state(save_path, safe_serialization=False)
+
+                image_logs = log_validation(
+                            args,
+                            vae,
+                            text_encoder,
+                            text_encoder_2,
+                            tokenizer,
+                            tokenizer_2,
+                            unet,
+                            accelerator,
+                            weight_dtype,
+                            global_step,
+                        )
         
         # Calculate and log the average loss for the epoch
         if num_steps > 0:

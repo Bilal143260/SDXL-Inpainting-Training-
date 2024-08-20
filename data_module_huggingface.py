@@ -85,13 +85,29 @@ def make_train_dataset(tokenizer1, tokenizer2):
     def prepare_images(examples):
         masks = []
         masked_images = []
+        original_sizes = []
+        crop_coords_top_lefts = []
+        target_sizes = []
 
         for target_image, mask_image in zip(examples[image_column],examples[conditioning_image_column]):
-            mask,masked_image = prepare_mask_and_masked_image(target_image, mask_image)
+            # Get original size before processing
+            original_width, original_height = target_image.size
+            original_sizes.append(torch.tensor([original_height, original_width]))
+
+            # Set crop coordinates top left (assuming no cropping)
+            crop_coords_top_lefts.append(torch.tensor([0, 0]))
+
+            # Set target size (assuming you resize to a fixed size)
+            target_width, target_height = 768, 1024  # replace with your target size
+            target_sizes.append(torch.tensor([target_height, target_width]))
+
+            # Resize mask and process images
+            mask_image = mask_image.resize((target_width, target_height))
+            mask, masked_image = prepare_mask_and_masked_image(target_image, mask_image)
             masks.append(mask)
             masked_images.append(masked_image)
 
-        return masks, masked_images
+        return masks, masked_images, original_sizes, crop_coords_top_lefts, target_sizes
 
     image_transforms = transforms.Compose(
         [
@@ -107,7 +123,8 @@ def make_train_dataset(tokenizer1, tokenizer2):
         images = [image_transforms(image) for image in images]
 
         examples["target_images"] = images
-        examples["masks"],examples["masked_images"] = prepare_images(examples)
+        examples["masks"], examples["masked_images"], examples["original_sizes"], \
+        examples["crop_coords_top_lefts"], examples["target_sizes"] = prepare_images(examples)
         examples["text_input_ids"] = tokenize_captions1(examples)
         examples["text_input_ids_2"] = tokenize_captions2(examples)
 
@@ -135,12 +152,19 @@ def collate_fn(examples):
     text_input_ids = torch.stack([example["text_input_ids"] for example in examples])
     text_input_ids_2 = torch.stack([example["text_input_ids_2"] for example in examples])
 
+    original_sizes = torch.stack([example["original_sizes"] for example in examples])
+    crop_coords_top_lefts = torch.stack([example["crop_coords_top_lefts"] for example in examples])
+    target_sizes = torch.stack([example["target_sizes"] for example in examples])
+
     return {
         "target_images": target_images,
         "masks": masks,
         "masked_images": masked_images,
         "text_input_ids": text_input_ids,
-        "text_input_ids_2": text_input_ids_2
+        "text_input_ids_2": text_input_ids_2,
+        "original_size": original_sizes,
+        "crop_coords_top_left": crop_coords_top_lefts,
+        "target_size": target_sizes,
     }
 
 if __name__ == "__main__":
